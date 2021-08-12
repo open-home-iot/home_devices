@@ -37,8 +37,6 @@ void setup() {
 void loop() {
   while ( Serial.available() )
   {
-    // Delay to await input
-    delay(2);
 
     /*
        Iterate over read bytes and put together a full request body,
