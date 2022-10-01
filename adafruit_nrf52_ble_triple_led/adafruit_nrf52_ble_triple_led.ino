@@ -5,23 +5,36 @@
 
 #include <bluefruit.h>
 
-// TODO: create HOME-specific header file.
-#define REQUEST_TYPE        0
-// Ignored since only 1 state group.
-#define REQUEST_STATE_GROUP 1
-#define REQUEST_NEW_STATE   2
+// Message start/end chars
+#define MSG_START_CHAR '^'
+#define MSG_END_CHAR   '$'
 
-#define REQUEST_CAPABILITY    48 // ASCII 0
-#define REQUEST_ACTION        49 // ASCII 1
-#define REQUEST_ACTION_STATES 50 // ASCII 2
+// Message indices
+#define I_MSG_TYPE        0
+#define I_MSG_STATE_GROUP 1
+#define I_MSG_NEW_STATE   2
 
-#define MSG_START 94 // ASCII ^
-#define MSG_END   36 // ASCII $
+// Message types
+#define MSG_CAPABILITY      '0'
+#define MSG_ACTION_STATEFUL '1'
+#define MSG_ACTION_STATES   '2'
 
-#define CAPABILITIES "^0{\"uuid\":\"b1585196-e856-4218-9130-c90d8e482c99\",\"name\":\"Basic LED\",\"category\":1,\"type\":1,\"states\":[{\"id\":0,\"control\":[{\"on\":1},{\"off\":0}]}]}$"
+// State groups
+#define STATE_GROUP_RED   '0'
+#define STATE_GROUP_GREEN '1'
+#define STATE_GROUP_BLUE  '2'
 
-#define STATE_LED_OFF 48
-#define STATE_LED_ON  49
+// New state
+#define NEW_STATE_LED_OFF '0'
+#define NEW_STATE_LED_ON  '1'
+
+// Device capability
+#define CAPABILITIES "^0{\"uuid\":\"b1585196-e856-4218-9130-c90d8e482c99\",\"name\":\"Basic LED\",\"category\":1,\"type\":1,\"states\":[{\"id\":0,\"red\":[{\"on\":1},{\"off\":0}]},{\"id\":1,\"green\":[{\"on\":1},{\"off\":0}]},{\"id\":2,\"blue\":[{\"on\":1},{\"off\":0}]}]}$"
+
+// LED pins
+#define PIN_RED   16
+#define PIN_GREEN 15
+#define PIN_BLUE  7
 
 /*
 BLE Services
@@ -34,23 +47,28 @@ BLE Services
 */
 BLEUart bleuart;
 
-uint8_t request[32];
-uint8_t cursor = 0;
+byte request[32];
+byte cursor = 0;
 
-uint8_t led_state = LOW;
-// Response indicating which stateful action state: ^100$ | ^101$
-// 0x5e | 94   = ^ - message start
-// 0x31 | 49   = 1 - message type, STATEFUL ACTION
-// 0x30 | 48   = 0 - group ID
-// 0x30 | 48   = 0 - LED state
-// 0x24 | 36   = $ - message end
-uint8_t response[5] = { 0x5e, 0x31, 0x30, 0x30, 0x24 };
+// Response indicating stateful action state: ^100$ | ^101$ | ^110$ | ^111$ | ^120$ | ^121$
+byte response[5] = { '^', '1', '0', '0', '$' };
+
+// State tracking, all are LOW by default
+byte states[3] = { LOW, LOW, LOW };
 
 void setup() {
 #if CFG_DEBUG
   // Blocking wait for connection when debug mode is enabled via IDE
   while ( !Serial ) yield();
 #endif
+
+  // pinmodes
+  pinMode(PIN_RED, OUTPUT);
+  digitalWrite(PIN_RED, LOW);
+  pinMode(PIN_GREEN, OUTPUT);
+  digitalWrite(PIN_GREEN, LOW);
+  pinMode(PIN_BLUE, OUTPUT);
+  digitalWrite(PIN_BLUE, LOW);
 
   // Setup the BLE LED to be enabled on CONNECT
   // Note: This is actually the default behavior, but provided
@@ -65,18 +83,12 @@ void setup() {
   Bluefruit.begin();
   Bluefruit.setName("Basic LED");
   Bluefruit.setTxPower(4);    // Check bluefruit.h for supported values
-  
-  Bluefruit.Periph.setConnectCallback(connect_callback);
-  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
 
   // Configure and Start BLE Uart Service
   bleuart.begin();
 
   // Set up and start advertising
   startAdv();
-
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, led_state);
 }
 
 void startAdv(void)
@@ -92,11 +104,9 @@ void startAdv(void)
   // Since there is no room for 'Name' in Advertising packet
   Bluefruit.ScanResponse.addName();
 
-  // SVC 16 bit, meaning [0] and [1] constitutes the SVC UUID, with [1] preceding [0].
-  // HOME SVC UUID: a1b2
-  // HOME SVC value: 1337
-  const uint8_t sData[] = { 0xb2, 0xa1, 0x13, 0x37 };
-  Bluefruit.ScanResponse.addData(BLE_GAP_AD_TYPE_SERVICE_DATA, &sData, 4);
+  // b1585196-e856-4218-9130-c90d8e482c99
+  const uint8_t sData[] = { 0x99, 0x2c, 0x48, 0x8e, 0x0d, 0xc9, 0x30, 0x91, 0x18, 0x42, 0x56, 0xe8, 0x96, 0x51, 0x58, 0xb1, 0xff, 0xff };
+  Bluefruit.ScanResponse.addData(BLE_GAP_AD_TYPE_SERVICE_DATA_128BIT_UUID, &sData, 18);
   
   /* Start Advertising
    * - Enable auto advertising if disconnected
@@ -121,12 +131,12 @@ void loop() {
        append to request array where cursor left off, if multiple
        read-iterations were necessary.
 
-       If encountering MSG_START:
+       If encountering MSG_START_CHAR:
        - clear request array
        - reset cursor
        - start appending request bytes to the request array
 
-       If encountering MSG_END:
+       If encountering MSG_END_CHAR:
        - execute request
        - continue parsing input bytes
 
@@ -134,12 +144,12 @@ void loop() {
     uint8_t ch;
     ch = (uint8_t) bleuart.read();
 
-    if (ch == MSG_START)
+    if (ch == MSG_START_CHAR)
     {
       memset(request, 0, sizeof(request));
       cursor = 0;
     }
-    else if (ch == MSG_END)
+    else if (ch == MSG_END_CHAR)
     {
       execute_request();
     }
@@ -156,57 +166,69 @@ void execute_request() {
      1. Find which request was received
      2. Execute the corresponding action
   */
-  if (request[REQUEST_TYPE] == REQUEST_CAPABILITY)
+  switch (request[I_MSG_TYPE]) 
   {
-    bleuart.write(CAPABILITIES);
-  }
-  else if (request[REQUEST_TYPE] == REQUEST_ACTION_STATES) 
-  {
-    if (led_state == LOW) 
-    {
-      response[3] = 0x30;  
-    }
-    else
-    {
-      response[3] = 0x31;
-    }
-    bleuart.write(response, 5);
-  }
-  else if (request[REQUEST_TYPE] == REQUEST_ACTION)
-  {
-    // Ignore checking state group since only one exists.
-    
-    if (request[REQUEST_NEW_STATE] == STATE_LED_ON)
-    {
-      led_state = HIGH;
-      digitalWrite(LED_BUILTIN, led_state);
-      response[3] = 0x31;
-      bleuart.write(response, 5);
-    }
-    else if (request[REQUEST_NEW_STATE] == STATE_LED_OFF)
-    {
-      led_state = LOW;
-      digitalWrite(LED_BUILTIN, led_state);
-      response[3] = 0x30;
-      bleuart.write(response, 5);
-    }
+    case MSG_CAPABILITY:
+      bleuart.write(CAPABILITIES);
+      break;
+    case MSG_ACTION_STATES:
+      report_action_states();
+      break;
+    case MSG_ACTION_STATEFUL:
+      change_led_state();
+      break;
+    default:
+      break;
   }
 }
 
-// callback invoked when central connects
-void connect_callback(uint16_t conn_handle)
+void report_action_states()
 {
-  // Get the reference to current connection
-  BLEConnection* connection = Bluefruit.Connection(conn_handle);
+  response[2] = STATE_GROUP_RED; // already ASCII formatted
+  response[3] = numberToAscii(states[0]);
+  bleuart.write(response, 5);
+  
+  response[2] = STATE_GROUP_GREEN; // already ASCII formatted
+  response[3] = numberToAscii(states[1]);
+  bleuart.write(response, 5);
+  
+  response[2] = STATE_GROUP_BLUE; // already ASCII formatted
+  response[3] = numberToAscii(states[2]);
+  bleuart.write(response, 5);
 }
 
-/**
- * Callback invoked when a connection is dropped
- * @param conn_handle connection where this event happens
- * @param reason is a BLE_HCI_STATUS_CODE which can be found in ble_hci.h
- */
-void disconnect_callback(uint16_t conn_handle, uint8_t reason)
+void change_led_state()
 {
-  (void) conn_handle;
-  (void) reason;
+  byte new_state = asciiToNumber(request[I_MSG_NEW_STATE]);
+  switch (request[I_MSG_STATE_GROUP])
+  {
+    case STATE_GROUP_RED:
+      digitalWrite(PIN_RED, new_state);
+      break;
+    case STATE_GROUP_GREEN:
+      digitalWrite(PIN_GREEN, new_state);
+      break;
+    case STATE_GROUP_BLUE:
+      digitalWrite(PIN_BLUE, new_state);
+      break;
+    default:
+      break;
+  }
+  // Update state array
+  states[asciiToNumber(request[I_MSG_STATE_GROUP])] = new_state;
+
+  // Update and send the response
+  response[2] = request[I_MSG_STATE_GROUP];
+  response[3] = request[I_MSG_NEW_STATE];
+  bleuart.write(response, 5);
+}
+
+byte asciiToNumber(char c) 
+{
+  return c - '0';
+}
+
+char numberToAscii(byte b)
+{
+  return b + '0';
 }
